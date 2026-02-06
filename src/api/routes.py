@@ -1,32 +1,44 @@
-"""API routes for LC0 Service."""
+"""API routes for Chess Engine Service."""
 
 from fastapi import APIRouter, HTTPException
 
-from ..engine import Lc0Wrapper
+from ..engine import BaseEngine, EngineType
 from .schemas import (
     AnalyzeRequest,
     AnalyzeResponse,
+    EngineStatus,
     HealthResponse,
     MoveCandidateResponse,
+    EngineType as SchemaEngineType,
 )
 
 router = APIRouter()
 
-# Engine instance (set by main.py on startup)
-_engine: Lc0Wrapper | None = None
+# Engine instances (set by main.py on startup)
+_engines: dict[EngineType, BaseEngine] = {}
 
 
-def set_engine(engine: Lc0Wrapper) -> None:
-    """Set the global engine instance."""
-    global _engine
-    _engine = engine
+def register_engine(engine_type: EngineType, engine: BaseEngine) -> None:
+    """Register an engine instance."""
+    _engines[engine_type] = engine
 
 
-def get_engine() -> Lc0Wrapper:
-    """Get the engine instance or raise if not available."""
-    if _engine is None:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    return _engine
+def get_engine(engine_type: EngineType) -> BaseEngine:
+    """Get an engine instance or raise if not available."""
+    # Map schema enum to engine enum
+    engine_enum = EngineType(engine_type.value)
+
+    if engine_enum not in _engines:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Engine '{engine_type.value}' not available"
+        )
+    return _engines[engine_enum]
+
+
+def get_available_engines() -> list[EngineType]:
+    """Get list of available engines."""
+    return list(_engines.keys())
 
 
 @router.post("/analyze", response_model=AnalyzeResponse)
@@ -34,16 +46,30 @@ async def analyze_position(request: AnalyzeRequest) -> AnalyzeResponse:
     """
     Analyze a chess position and return candidate moves with evaluations.
 
-    Uses Leela Chess Zero (LC0) neural network for evaluation.
+    Supports multiple engines:
+    - **lc0**: Leela Chess Zero neural network (AlphaZero-style)
+    - **stockfish**: Stockfish with NNUE (strongest traditional engine)
+    - **maia**: Human-like engine (predicts human moves)
     """
-    engine = get_engine()
+    engine_type = EngineType(request.engine.value)
+    engine = get_engine(request.engine)
 
     try:
-        analysis = await engine.analyze_position(
-            fen=request.fen,
-            nodes=request.nodes,
-            num_moves=request.num_moves,
-        )
+        # Use appropriate parameters based on engine type
+        if engine_type == EngineType.STOCKFISH:
+            # Stockfish prefers depth
+            analysis = await engine.analyze_position(
+                fen=request.fen,
+                depth=request.depth or 20,
+                num_moves=request.num_moves,
+            )
+        else:
+            # LC0/Maia use nodes
+            analysis = await engine.analyze_position(
+                fen=request.fen,
+                nodes=request.nodes,
+                num_moves=request.num_moves,
+            )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
@@ -60,10 +86,12 @@ async def analyze_position(request: AnalyzeRequest) -> AnalyzeResponse:
 
     return AnalyzeResponse(
         fen=analysis.fen,
+        engine=engine_type.value,
         candidates=candidates,
         evaluation_cp=analysis.evaluation_cp,
         total_nodes=analysis.total_nodes,
         time_ms=analysis.time_ms,
+        depth=analysis.depth,
     )
 
 
@@ -72,18 +100,84 @@ async def health_check() -> HealthResponse:
     """Check service health and engine status."""
     from ..config import settings
 
-    engine_ready = False
-    if _engine is not None:
-        try:
-            engine_ready = await _engine.is_ready()
-        except Exception:
-            engine_ready = False
+    engine_statuses = []
 
-    status = "healthy" if engine_ready else "degraded"
+    # Check LC0
+    lc0_ready = False
+    if EngineType.LC0 in _engines:
+        try:
+            lc0_ready = await _engines[EngineType.LC0].is_ready()
+        except Exception:
+            pass
+    engine_statuses.append(EngineStatus(
+        name="lc0",
+        ready=lc0_ready,
+        enabled=True,  # LC0 always enabled
+    ))
+
+    # Check Stockfish
+    stockfish_ready = False
+    if EngineType.STOCKFISH in _engines:
+        try:
+            stockfish_ready = await _engines[EngineType.STOCKFISH].is_ready()
+        except Exception:
+            pass
+    engine_statuses.append(EngineStatus(
+        name="stockfish",
+        ready=stockfish_ready,
+        enabled=settings.stockfish_enabled,
+    ))
+
+    # Check Maia
+    maia_ready = False
+    if EngineType.MAIA in _engines:
+        try:
+            maia_ready = await _engines[EngineType.MAIA].is_ready()
+        except Exception:
+            pass
+    engine_statuses.append(EngineStatus(
+        name="maia",
+        ready=maia_ready,
+        enabled=settings.maia_enabled,
+    ))
+
+    # Overall status
+    any_ready = any(e.ready for e in engine_statuses)
+    status = "healthy" if any_ready else "degraded"
 
     return HealthResponse(
         status=status,
-        engine_ready=engine_ready,
-        backend=settings.lc0_backend,
-        gpu_ids=settings.gpu_ids_list,
+        engines=engine_statuses,
     )
+
+
+@router.get("/engines")
+async def list_engines() -> dict:
+    """List available chess engines."""
+    from ..config import settings
+
+    return {
+        "engines": [
+            {
+                "id": "lc0",
+                "name": "Leela Chess Zero",
+                "description": "Neural network engine (AlphaZero-style)",
+                "type": "neural_network",
+                "available": EngineType.LC0 in _engines,
+            },
+            {
+                "id": "stockfish",
+                "name": "Stockfish",
+                "description": "Strongest traditional engine with NNUE",
+                "type": "traditional",
+                "available": EngineType.STOCKFISH in _engines and settings.stockfish_enabled,
+            },
+            {
+                "id": "maia",
+                "name": "Maia Chess",
+                "description": "Human-like engine (predicts human moves)",
+                "type": "neural_network",
+                "available": EngineType.MAIA in _engines and settings.maia_enabled,
+            },
+        ]
+    }

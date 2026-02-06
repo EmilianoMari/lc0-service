@@ -1,4 +1,4 @@
-"""Wrapper per Leela Chess Zero (Lc0) via protocollo UCI."""
+"""Wrapper per Stockfish via protocollo UCI."""
 
 import asyncio
 import re
@@ -15,53 +15,45 @@ logger = structlog.get_logger(__name__)
 
 
 @dataclass
-class Lc0Config:
-    """Configurazione per Lc0 engine."""
+class StockfishConfig:
+    """Configurazione per Stockfish engine."""
 
     executable_path: Path
-    network_path: Path
-    backend: str = "cuda-fp16"
-    gpu_ids: list[int] = field(default_factory=lambda: [0])
-    hash_mb: int = 4096
+    hash_mb: int = 2048
     threads: int = 4
-
-    # Parametri MCTS
-    minibatch_size: int = 256
-    max_prefetch: int = 32
-    cpuct: float = 1.745
-    fpu_strategy: str = "reduction"
-    fpu_value: float = 0.33
-
-    # MultiPV
     multipv: int = 10
+
+    # NNUE
+    use_nnue: bool = True
+
+    # Skill level (0-20, 20 = strongest)
+    skill_level: int = 20
 
     def to_uci_options(self) -> list[tuple[str, str]]:
         """Converte config in opzioni UCI."""
-        gpu_str = ",".join(str(g) for g in self.gpu_ids)
-        return [
-            ("WeightsFile", str(self.network_path)),
-            ("Backend", self.backend),
-            ("BackendOptions", f"gpu={gpu_str}"),
+        options = [
             ("Hash", str(self.hash_mb)),
             ("Threads", str(self.threads)),
-            ("MinibatchSize", str(self.minibatch_size)),
-            ("MaxPrefetch", str(self.max_prefetch)),
-            ("CPuct", str(self.cpuct)),
-            ("FpuStrategy", self.fpu_strategy),
-            ("FpuValue", str(self.fpu_value)),
             ("MultiPV", str(self.multipv)),
-            ("VerboseMoveStats", "true"),
-            ("LogLiveStats", "true"),
-            ("SmartPruningFactor", "0"),  # Disabilita pruning per analisi completa
+            ("UCI_AnalyseMode", "true"),
         ]
 
+        if self.use_nnue:
+            options.append(("Use NNUE", "true"))
 
-class Lc0Wrapper(BaseEngine):
-    """Wrapper asincrono per comunicazione con Lc0 via UCI."""
+        if self.skill_level < 20:
+            options.append(("Skill Level", str(self.skill_level)))
 
-    def __init__(self, config: Lc0Config, engine_type: EngineType = EngineType.LC0):
+        return options
+
+
+class StockfishWrapper(BaseEngine):
+    """Wrapper asincrono per comunicazione con Stockfish via UCI."""
+
+    engine_type = EngineType.STOCKFISH
+
+    def __init__(self, config: StockfishConfig):
         self.config = config
-        self.engine_type = engine_type
         self._process: asyncio.subprocess.Process | None = None
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -69,12 +61,12 @@ class Lc0Wrapper(BaseEngine):
         self._is_ready = False
 
     async def start(self) -> None:
-        """Avvia il processo Lc0."""
+        """Avvia il processo Stockfish."""
         if self._process is not None:
-            logger.warning("Lc0 già avviato, riavvio...")
+            logger.warning("Stockfish già avviato, riavvio...")
             await self.stop()
 
-        logger.info("Avvio Lc0", path=str(self.config.executable_path))
+        logger.info("Avvio Stockfish", path=str(self.config.executable_path))
 
         self._process = await asyncio.create_subprocess_exec(
             str(self.config.executable_path),
@@ -99,20 +91,20 @@ class Lc0Wrapper(BaseEngine):
         await self._wait_for("readyok")
 
         self._is_ready = True
-        logger.info("Lc0 pronto", backend=self.config.backend, gpus=self.config.gpu_ids)
+        logger.info("Stockfish pronto", threads=self.config.threads, hash=self.config.hash_mb)
 
     async def stop(self) -> None:
-        """Ferma il processo Lc0."""
+        """Ferma il processo Stockfish."""
         if self._process is None:
             return
 
-        logger.info("Arresto Lc0")
+        logger.info("Arresto Stockfish")
         await self._send_command("quit")
 
         try:
             await asyncio.wait_for(self._process.wait(), timeout=5.0)
         except asyncio.TimeoutError:
-            logger.warning("Timeout arresto Lc0, terminazione forzata")
+            logger.warning("Timeout arresto Stockfish, terminazione forzata")
             self._process.kill()
             await self._process.wait()
 
@@ -122,18 +114,18 @@ class Lc0Wrapper(BaseEngine):
         self._is_ready = False
 
     async def _send_command(self, command: str) -> None:
-        """Invia comando UCI a Lc0."""
+        """Invia comando UCI a Stockfish."""
         if self._writer is None:
-            raise RuntimeError("Lc0 non avviato")
+            raise RuntimeError("Stockfish non avviato")
 
         logger.debug("UCI >>", command=command)
         self._writer.write(f"{command}\n".encode())
         await self._writer.drain()
 
     async def _read_line(self) -> str:
-        """Legge una linea da Lc0."""
+        """Legge una linea da Stockfish."""
         if self._reader is None:
-            raise RuntimeError("Lc0 non avviato")
+            raise RuntimeError("Stockfish non avviato")
 
         line = await self._reader.readline()
         decoded = line.decode().strip()
@@ -155,7 +147,7 @@ class Lc0Wrapper(BaseEngine):
         info_lines = []
         while True:
             line = await self._read_line()
-            if line.startswith("info"):
+            if line.startswith("info") and "pv" in line:
                 info_lines.append(line)
             elif line.startswith("bestmove"):
                 return info_lines, line
@@ -168,19 +160,10 @@ class Lc0Wrapper(BaseEngine):
         time_ms: int | None = None,
         num_moves: int | None = None,
     ) -> PositionAnalysis:
-        """
-        Analizza una posizione e ritorna le mosse candidate.
-
-        Args:
-            fen: Posizione in formato FEN
-            nodes: Numero di nodi da esplorare
-            depth: Profondità massima
-            time_ms: Tempo massimo in millisecondi
-            num_moves: Numero di mosse candidate (override MultiPV)
-        """
+        """Analizza una posizione e ritorna le mosse candidate."""
         async with self._lock:
             if not self._is_ready:
-                raise RuntimeError("Lc0 non pronto, chiamare start() prima")
+                raise RuntimeError("Stockfish non pronto, chiamare start() prima")
 
             # Imposta MultiPV se richiesto
             if num_moves is not None and num_moves != self.config.multipv:
@@ -190,16 +173,19 @@ class Lc0Wrapper(BaseEngine):
             await self._send_command(f"position fen {fen}")
 
             # Costruisci comando go
+            # Stockfish usa depth o time, nodes è meno affidabile
             go_cmd = "go"
-            if nodes is not None:
-                go_cmd += f" nodes {nodes}"
             if depth is not None:
                 go_cmd += f" depth {depth}"
-            if time_ms is not None:
+            elif time_ms is not None:
                 go_cmd += f" movetime {time_ms}"
-            if go_cmd == "go":
-                # Default: usa nodes dalla config
-                go_cmd += f" nodes {100000}"
+            elif nodes is not None:
+                # Converti nodes in depth approssimativo per Stockfish
+                # Rule of thumb: ~100k nodes per depth level
+                approx_depth = max(15, min(30, 10 + nodes // 100000))
+                go_cmd += f" depth {approx_depth}"
+            else:
+                go_cmd += " depth 20"
 
             await self._send_command(go_cmd)
 
@@ -237,7 +223,6 @@ class Lc0Wrapper(BaseEngine):
         nps_pattern = re.compile(r"nps (\d+)")
         score_cp_pattern = re.compile(r"score cp (-?\d+)")
         score_mate_pattern = re.compile(r"score mate (-?\d+)")
-        wdl_pattern = re.compile(r"wdl (\d+) (\d+) (\d+)")
         pv_pattern = re.compile(r" pv (.+)$")
 
         for line in info_lines:
@@ -284,15 +269,8 @@ class Lc0Wrapper(BaseEngine):
             elif cp_match:
                 score_cp = int(cp_match.group(1))
 
-            # Estrai WDL
-            wdl = (333, 334, 333)  # Default
-            wdl_match = wdl_pattern.search(line)
-            if wdl_match:
-                wdl = (
-                    int(wdl_match.group(1)),
-                    int(wdl_match.group(2)),
-                    int(wdl_match.group(3)),
-                )
+            # Stockfish non fornisce WDL direttamente, lo stimiamo
+            wdl = self._estimate_wdl(score_cp)
 
             # Estrai PV
             pv: list[str] = []
@@ -358,12 +336,31 @@ class Lc0Wrapper(BaseEngine):
             multipv=len(sorted_candidates),
         )
 
-    async def get_best_move(
-        self, fen: str, nodes: int | None = None, time_ms: int | None = None
-    ) -> str | None:
-        """Ritorna solo la mossa migliore (più veloce di analyze_position)."""
-        analysis = await self.analyze_position(fen, nodes=nodes, time_ms=time_ms, num_moves=1)
-        return analysis.best_move.move if analysis.best_move else None
+    def _estimate_wdl(self, score_cp: int) -> tuple[int, int, int]:
+        """
+        Stima Win/Draw/Loss da centipawns.
+
+        Basato su formule empiriche di Stockfish.
+        """
+        # Sigmoid-like conversion
+        import math
+
+        # Normalizza score
+        score = score_cp / 100.0
+
+        # Probabilità vittoria (sigmoid)
+        win_prob = 1.0 / (1.0 + math.exp(-score * 0.5))
+
+        # Probabilità patta (più alta vicino a 0)
+        draw_prob = 0.3 * math.exp(-abs(score) * 0.3)
+
+        # Normalizza
+        total = win_prob + draw_prob + (1 - win_prob)
+        win = int((win_prob / total) * 1000)
+        draw = int((draw_prob / total) * 1000)
+        loss = 1000 - win - draw
+
+        return (win, draw, loss)
 
     async def is_ready(self) -> bool:
         """Verifica se l'engine è pronto."""
@@ -384,12 +381,12 @@ class Lc0Wrapper(BaseEngine):
 
     @property
     def is_running(self) -> bool:
-        """True se il processo Lc0 è in esecuzione."""
+        """True se il processo Stockfish è in esecuzione."""
         return self._process is not None and self._process.returncode is None
 
 
-async def create_engine(config: Lc0Config) -> Lc0Wrapper:
-    """Factory function per creare e avviare un engine."""
-    engine = Lc0Wrapper(config)
+async def create_stockfish(config: StockfishConfig) -> StockfishWrapper:
+    """Factory function per creare e avviare Stockfish."""
+    engine = StockfishWrapper(config)
     await engine.start()
     return engine

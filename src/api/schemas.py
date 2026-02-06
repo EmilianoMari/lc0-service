@@ -1,6 +1,16 @@
 """Pydantic schemas for API requests and responses."""
 
+from enum import Enum
+
 from pydantic import BaseModel, Field
+
+
+class EngineType(str, Enum):
+    """Supported chess engines."""
+
+    LC0 = "lc0"
+    STOCKFISH = "stockfish"
+    MAIA = "maia"
 
 
 class AnalyzeRequest(BaseModel):
@@ -11,11 +21,21 @@ class AnalyzeRequest(BaseModel):
         description="Chess position in FEN notation",
         examples=["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"],
     )
+    engine: EngineType = Field(
+        default=EngineType.LC0,
+        description="Chess engine to use for analysis",
+    )
     nodes: int = Field(
         default=100000,
         ge=1000,
         le=10000000,
-        description="Number of nodes to search",
+        description="Number of nodes to search (LC0/Maia)",
+    )
+    depth: int | None = Field(
+        default=None,
+        ge=1,
+        le=50,
+        description="Search depth (Stockfish)",
     )
     num_moves: int = Field(
         default=10,
@@ -52,17 +72,20 @@ class AnalyzeResponse(BaseModel):
     """Response body for /analyze endpoint."""
 
     fen: str = Field(..., description="The analyzed position")
+    engine: str = Field(..., description="Engine used for analysis")
     candidates: list[MoveCandidateResponse] = Field(
         ..., description="Ranked list of candidate moves"
     )
     evaluation_cp: int = Field(..., description="Position evaluation in centipawns")
     total_nodes: int = Field(..., description="Total nodes searched")
     time_ms: int = Field(..., description="Time spent analyzing in milliseconds")
+    depth: int = Field(default=0, description="Search depth reached")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "engine": "lc0",
                 "candidates": [
                     {
                         "move": "e2e4",
@@ -75,24 +98,33 @@ class AnalyzeResponse(BaseModel):
                 "evaluation_cp": 35,
                 "total_nodes": 100000,
                 "time_ms": 2500,
+                "depth": 15,
             }
         }
+
+
+class EngineStatus(BaseModel):
+    """Status of a single engine."""
+
+    name: str
+    ready: bool
+    enabled: bool
 
 
 class HealthResponse(BaseModel):
     """Response for health check endpoint."""
 
     status: str = Field(..., description="Service status")
-    engine_ready: bool = Field(..., description="Whether LC0 engine is ready")
-    backend: str = Field(..., description="LC0 backend in use")
-    gpu_ids: list[int] = Field(..., description="GPU IDs being used")
+    engines: list[EngineStatus] = Field(..., description="Status of each engine")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "status": "healthy",
-                "engine_ready": True,
-                "backend": "cuda-fp16",
-                "gpu_ids": [0],
+                "engines": [
+                    {"name": "lc0", "ready": True, "enabled": True},
+                    {"name": "stockfish", "ready": True, "enabled": True},
+                    {"name": "maia", "ready": True, "enabled": True},
+                ],
             }
         }
