@@ -26,7 +26,7 @@ jobs:
       - name: Set image metadata
         id: meta
         run: |
-          REPO_NAME="lc0-service"
+          REPO_NAME="chess-engine"
           OWNER_NAME=$(dirname "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
           IMAGE_TAG="prod-${SHORT_SHA}"
@@ -104,7 +104,7 @@ jobs:
             exit 1
           fi
 
-      - name: Deploy lc0-service to Nomad
+      - name: Deploy Chess Engine to Nomad
         env:
           NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_CLIENT_ID }}
@@ -113,7 +113,7 @@ jobs:
         run: |
           cd seas-infra
 
-          PACK_PATH="packs/lc0-service"
+          PACK_PATH="packs/chess-engine"
 
           echo "============================================"
           echo "Deploying image: $FULL_IMAGE"
@@ -137,7 +137,7 @@ jobs:
           echo "Pack rendered successfully"
 
           # Save rendered job
-          TEMP_JOB="/tmp/lc0-service.nomad"
+          TEMP_JOB="/tmp/chess-engine.nomad"
           echo "$RENDERED" | tail -n +3 > "$TEMP_JOB"
 
           # Convert to JSON
